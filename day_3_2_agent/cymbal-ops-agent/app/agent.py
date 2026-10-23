@@ -36,6 +36,7 @@ TOOL DISPATCH PROTOCOLS:
 - PARALLEL TOOL DISPATCH: When asked to compare live real-time cashier metrics against historical 7-day baselines (e.g. UC 2.2), invoke `read_cashier_realtime_alerts` AND `cymbal_analytics_tool` concurrently in the same turn.
 - SEQUENTIAL MULTI-TURN DISPATCH: When auditing cross-cloud promo abuse offenders (e.g. UC 2.3), first call `cymbal_analytics_tool` to rank top promo abuse offenders in GCP BigQuery (`pos_anomaly_alerts`), then invoke `cymbal_analytics_tool` to retrieve checkout logs from AWS S3 (`silver_pos_transactions`) for the top offending cashier.
 - STRICT GROUNDING: Base every sentence of your final response strictly on the data returned by the invoked tools. Avoid ungrounded introductory or concluding conversational filler.
+- DEGRADED MODE (NFR-4.1 / NFR-4.3): If any tool returns `"status": "UNAVAILABLE"` or a `[FALLBACK: status=UNAVAILABLE]` message, still answer with the results from the tools that succeeded, and explicitly state which subsystem (e.g. "live real-time store data" or "analytics warehouse") is currently unavailable. Never invent values for the unavailable subsystem, and never repeat error codes, exception text, hostnames, URLs or connection details.
 """
 
 cymbal_operations_agent = LlmAgent(

@@ -1,12 +1,15 @@
 """BigQuery Conversational Data Agent tool gateway for Cymbal Retail."""
 
 import json
+import logging
 import os
 import time
 import urllib.error
 import urllib.request
 import google.auth
 import google.auth.transport.requests
+
+logger = logging.getLogger(__name__)
 
 
 def _get_access_token() -> str:
@@ -110,18 +113,25 @@ def cymbal_analytics_tool(query: str) -> str:
             return "No analytical results returned from the BigQuery Conversational Data Agent."
 
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+            logger.warning(
+                "cymbal_analytics_tool attempt %d/%d failed: %s: %s",
+                attempt, max_attempts, type(exc).__name__, exc,
+            )
             if attempt < max_attempts:
                 time.sleep(backoff_seconds)
                 backoff_seconds *= 2
                 continue
+            # NFR-4.1: no exception text, URLs or stack traces in the tool result.
             return (
-                "[FALLBACK: BigQuery Conversational Data Agent is temporarily unavailable "
-                f"after {max_attempts} retry attempts ({exc}). Please retry your analytical query shortly.]"
+                "[FALLBACK: status=UNAVAILABLE] Regional Store data is currently unreachable "
+                f"(analytics warehouse did not respond after {max_attempts} attempts). "
+                "Please retry your analytical query shortly."
             )
         except Exception as exc:
+            logger.exception("cymbal_analytics_tool unexpected error: %s", exc)
             return (
-                "[FALLBACK: Unexpected error querying BigQuery Conversational Data Agent: "
-                f"{exc}]"
+                "[FALLBACK: status=UNAVAILABLE] Regional Store data is currently unreachable. "
+                "Please retry your analytical query shortly."
             )
 
     return "[FALLBACK: Exhausted retries calling BigQuery Conversational Data Agent.]"

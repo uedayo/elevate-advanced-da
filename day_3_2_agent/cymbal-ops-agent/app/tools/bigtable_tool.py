@@ -1,14 +1,21 @@
 """Cloud Bigtable real-time cashier alert tool via Cloud Run MCP Toolbox."""
 
 import json
+import logging
 import os
 import shutil
 import subprocess
+import time
 import urllib.error
 import urllib.request
 import google.auth
 import google.auth.transport.requests
 import google.oauth2.id_token
+
+logger = logging.getLogger(__name__)
+
+# NFR-4.1 user-facing fallback text (BRD 6.4). Internal details go to server logs only.
+UNAVAILABLE_MESSAGE = "Regional Store data is currently unreachable"
 
 
 DEFAULT_MCP_SERVICE_URL = (
@@ -128,66 +135,96 @@ def read_cashier_realtime_alerts(row_key_prefix: str) -> str:
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    try:
-        req = urllib.request.Request(
-            mcp_endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw_resp = json.loads(resp.read().decode("utf-8"))
+    max_attempts = 3
+    backoff_seconds = 2.0
+    last_error = ""
 
-        content_items = raw_resp.get("result", {}).get("content", [])
-        if not content_items:
-            return json.dumps(
-                {
-                    "source": "Cloud Run MCP Toolbox for Databases (Direct /mcp JSON-RPC)",
-                    "row_key_prefix": row_key_prefix,
-                    "status": "NO_RECORDS_FOUND",
-                },
-                indent=2,
+    for attempt in range(1, max_attempts + 1):
+        try:
+            req = urllib.request.Request(
+                mcp_endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
             )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw_resp = json.loads(resp.read().decode("utf-8"))
 
-        raw_text = content_items[0].get("text", "")
-        parsed = json.loads(raw_text)
-        if isinstance(parsed, list):
-            record = parsed[0] if parsed else {}
-        elif isinstance(parsed, dict):
-            record = parsed
-        else:
-            record = {"raw": parsed}
+            result = raw_resp.get("result", {})
+            content_items = result.get("content", [])
+            if result.get("isError"):
+                # MCP-level tool error (e.g. SQL/permission): not transient, do not retry.
+                last_error = content_items[0].get("text", "") if content_items else "isError"
+                break
+            if not content_items:
+                return json.dumps(
+                    {
+                        "source": "Cloud Run MCP Toolbox for Databases (Direct /mcp JSON-RPC)",
+                        "row_key_prefix": row_key_prefix,
+                        "status": "NO_RECORDS_FOUND",
+                    },
+                    indent=2,
+                )
 
-        result_obj = {
-            "source": "Cloud Run MCP Toolbox for Databases (Direct /mcp JSON-RPC)",
-            "snapshot_type": (
-                "Latest 1-Hour Rolling Window Aggregation Snapshot "
-                "(Already aggregated over the past 60 minutes. Do NOT sum or aggregate across multiple rows.)"
-            ),
-            "row_key": record.get("row_key"),
-            "audit_status": record.get("audit_status"),
-            "cashier_1h_total_discount_usd": record.get(
-                "cashier_1h_total_discount_usd"
-            ),
-            "cashier_1h_txn_count": record.get("cashier_1h_txn_count"),
-            "cashier_1h_avg_discount_pct": record.get(
-                "cashier_1h_avg_discount_pct"
-            ),
-            "cashier_1h_manual_override_count": record.get(
-                "cashier_1h_manual_override_count"
-            ),
-            "cashier_1h_promo_count": record.get("cashier_1h_promo_count"),
-            "cashier_1h_promo_rate": record.get("cashier_1h_promo_rate"),
-            "last_event_ts": record.get("last_event_ts"),
-            "risk_score": record.get("risk_score"),
-        }
-        return json.dumps(result_obj, indent=2)
+            raw_text = content_items[0].get("text", "")
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, list):
+                record = parsed[0] if parsed else {}
+            elif isinstance(parsed, dict):
+                record = parsed
+            else:
+                record = {"raw": parsed}
 
-    except Exception as exc:
-        return json.dumps(
-            {
+            result_obj = {
                 "source": "Cloud Run MCP Toolbox for Databases (Direct /mcp JSON-RPC)",
-                "error": f"Failed to read cashier realtime alerts for {row_key_prefix}: {exc}",
-            },
-            indent=2,
-        )
+                "snapshot_type": (
+                    "Latest 1-Hour Rolling Window Aggregation Snapshot "
+                    "(Already aggregated over the past 60 minutes. Do NOT sum or aggregate across multiple rows.)"
+                ),
+                "row_key": record.get("row_key"),
+                "audit_status": record.get("audit_status"),
+                "cashier_1h_total_discount_usd": record.get(
+                    "cashier_1h_total_discount_usd"
+                ),
+                "cashier_1h_txn_count": record.get("cashier_1h_txn_count"),
+                "cashier_1h_avg_discount_pct": record.get(
+                    "cashier_1h_avg_discount_pct"
+                ),
+                "cashier_1h_manual_override_count": record.get(
+                    "cashier_1h_manual_override_count"
+                ),
+                "cashier_1h_promo_count": record.get("cashier_1h_promo_count"),
+                "cashier_1h_promo_rate": record.get("cashier_1h_promo_rate"),
+                "last_event_ts": record.get("last_event_ts"),
+                "risk_score": record.get("risk_score"),
+            }
+            return json.dumps(result_obj, indent=2)
+
+        except Exception as exc:  # transient network / HTTP / decode failures
+            last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "read_cashier_realtime_alerts attempt %d/%d failed for %s: %s",
+                attempt,
+                max_attempts,
+                row_key_prefix,
+                last_error,
+            )
+            if attempt < max_attempts:
+                time.sleep(backoff_seconds)
+                backoff_seconds *= 2
+
+    # NFR-4.1: never surface hostnames, exception text or stack traces to the LLM / user.
+    logger.error(
+        "read_cashier_realtime_alerts UNAVAILABLE for %s after retries: %s",
+        row_key_prefix,
+        last_error,
+    )
+    return json.dumps(
+        {
+            "source": "Real-time operational cache (Cloud Bigtable)",
+            "row_key_prefix": row_key_prefix,
+            "status": "UNAVAILABLE",
+            "message": UNAVAILABLE_MESSAGE,
+        },
+        indent=2,
+    )

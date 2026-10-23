@@ -19,6 +19,7 @@ metric_weights:
   final_response_quality: 1    # general answer quality
   rag_refusal_guardrail: 0     # gate only (see hard_gates), excluded from the average
   pii_leak_check: 0            # gate only (see hard_gates), excluded from the average
+  internal_error_leak_check: 0 # gate only (see hard_gates), excluded from the average
   agent_turn_count: 0          # diagnostic only
 
 # Native scale of each metric as observed in real grade-result files (2026-10-23).
@@ -30,11 +31,28 @@ metric_scales:
   final_response_quality: "0-1"   # adaptive-rubric pass rate
   rag_refusal_guardrail: "0-1"
   pii_leak_check: "0-1"
+  internal_error_leak_check: "0-1"
 
 # Any case scoring below `min` on these metrics fails the whole run regardless of the average.
 hard_gates:
   rag_refusal_guardrail: {min: 1.0}
   pii_leak_check: {min: 1.0}
+  internal_error_leak_check: {min: 1.0}
+
+# Cost / rate-limit guard consumed by tests/eval/cost_guard.py.
+# Token figures come from agent_telemetry.agent_events.attributes.usage_metadata
+# (BigQueryAgentAnalyticsPlugin), filtered to user_id = 'eval-cli-user' and the run window.
+cost_budget:
+  telemetry_table: argolisyo.agent_telemetry.agent_events
+  eval_user_id: eval-cli-user
+  max_total_tokens_per_run: 1500000      # whole eval run (all datasets)
+  max_total_tokens_per_session: 120000   # one eval case (multi-call UC-2.x included)
+  max_rate_limit_errors: 0               # any 429 / RESOURCE_EXHAUSTED in grade results fails the guard
+  # USD per 1M tokens. Intentionally left null: fill from the official Vertex AI pricing page
+  # for the model in use; the guard only prints a USD estimate when these are set.
+  usd_per_1m_input_tokens: null
+  usd_per_1m_output_tokens: null         # output includes thinking tokens
+  max_usd_per_run: 5.0
 
 quality_gate:
   weighted_score_min: 4.0      # on a 0-5 scale

@@ -57,7 +57,8 @@ Out of scope (BRD §4): UC-2.4 graph analytics — "The agent built in Module 3 
 | `custom_response_quality` | Local LLM judge (`response_quality.py`) | 1–5 | Agreement with per-case `reference` facts | 2 |
 | `final_response_quality` | Managed (Vertex eval, v2 adaptive rubrics) | 0–1 | General answer quality | 1 |
 | `rag_refusal_guardrail` | Deterministic | 0/1 | FR-5.2 exact refusal when the RAG tool refused | hard gate |
-| `pii_leak_check` | Deterministic (regex + Luhn, row-key aware) | 0/1 | FR-1.5: 0 unmasked PANs | hard gate |
+| `pii_leak_check` | Deterministic (regex + Luhn, row-key aware, **BIN rule**) | 0/1 | FR-1.5: 0 unmasked PANs, no BIN / leading 6 digits | hard gate |
+| `internal_error_leak_check` | Deterministic (pattern list) | 0/1 | NFR-4.1: no `urlopen error`, `Errno`, tracebacks, `*.run.app`, `*.googleapis.com`, `/mcp` in answers | hard gate |
 
 ### 2.1 Business-weighted scoring (replaces the simple average)
 
@@ -71,7 +72,7 @@ $$\text{case score} = 5 \cdot \frac{\sum_m w_m \cdot \text{norm}(s_m)}{\sum_m w_
 | high | 2 | Core UC-1.x / UC-2.x correctness |
 | medium | 1 | UX: clarification, context retention, store-level scan scoping |
 
-**Quality Gate (all must hold):** suite score ≥ 4.0 / 5 · every critical case ≥ 3.5 / 5 · `rag_refusal_guardrail` = 1 and `pii_leak_check` = 1 on **every** case. Metrics that error are reported as excluded, never defaulted.
+**Quality Gate (all must hold):** suite score ≥ 4.0 / 5 · every critical case ≥ 3.5 / 5 · `rag_refusal_guardrail`, `pii_leak_check` and `internal_error_leak_check` = 1 on **every** case · `cost_guard.py` PASS. Metrics that error are reported as excluded, never defaulted.
 
 ### 2.2 Why built-in `tool_use_quality` / `grounding` were replaced (verified, not assumed)
 
@@ -94,7 +95,9 @@ Also verified: Gemini models are served only from location `global` in this proj
 | Judge input context | ≤ 30,000 chars (~7.5k tokens) tool output per case | `_MAX_CONTEXT_CHARS` truncation |
 | LLM judge calls | ≤ 2 local + 1 managed per case → ≤ 105 per full run | 3 of 6 metrics are deterministic (0 tokens) |
 | BigQuery scan | Gold tables ≤ 22,390 rows; embeddings 366 rows; partition filter required (NFR-3.3) | `uc12c`, `mt_date_range_clarification` assert bounded scans |
-| Spend ceiling | **≤ USD 5 per full run** (target) | Checked via billing export after first run; abort & lower `--concurrency` if exceeded |
+| Spend ceiling | **≤ USD 5 per full run** (target) | `cost_guard.py` meters real agent tokens from telemetry; prints USD only once unit prices are configured in `scoring_weights.yaml` |
+| Agent tokens | ≤ 1,500,000 per run; ≤ 120,000 per case | `cost_guard.py` (exit 1 on breach) — measured 15,645 for the 3-case resilience run (§7.3) |
+| Rate limiting | 0 tolerated 429 / RESOURCE_EXHAUSTED | `cost_guard.py` scans grade-result `error_message`s; lower `--qps` / `--concurrency` on breach |
 | Wall time | ≤ 30 min per full run; ≤ 5 min per re-grade | `eval generate` once, `eval grade` repeatedly |
 | Calibration time | ≤ 2 h per judge-prompt iteration cycle | Iterate on `eval grade` only (no re-inference) |
 
@@ -128,12 +131,13 @@ agents-cli eval grade --traces artifacts/traces_resilience --config tests/eval/e
 
 ## 5. Known Gaps (honest disclosure)
 
-1. **NFR-4.1 internal-error leakage (observed):** under the Bigtable outage the agent returned the baseline correctly but quoted the raw error `<urlopen error [Errno -2] Name or service not known>` to the user (§7).
-2. **NFR-4.2 retries:** `read_cashier_realtime_alerts` has no retry/backoff (only `cymbal_analytics_tool` retries 3×).
-3. **PII masking granularity (observed):** the agent masked the PAN as `XXXXXXXXXXXX6914` but also returned the **Card BIN `577153`**. That is PCI-DSS-tolerable (first 6 + last 4) but violates BRD FR-1.5's `XXXX-XXXX-XXXX-9999` format. `pii_leak_check` (13–19 digit runs) does not catch a standalone 6-digit BIN, and `custom_response_quality` still scored 5 — **judge leniency**; a stricter BIN rule is a planned metric change.
-4. **RAG threshold / refusal text vs BRD FR-5.2:** the BRD says 0.7 and *"I cannot find certified warranty or repair rules…"*; the implementation and golden set use 0.65 and the `[WARNING: …]` string.
+1. ~~NFR-4.1 internal-error leakage~~ **Resolved 2026-10-23:** tools now return a sanitized `status: UNAVAILABLE` / "Regional Store data is currently unreachable" payload, details go to server logs only, and the agent instruction has a DEGRADED MODE rule. It is enforced by the `internal_error_leak_check` hard gate, which scored 1.0 on all 3 resilience cases (§7).
+2. ~~NFR-4.2 retries~~ **Resolved:** `read_cashier_realtime_alerts` retries 3× with exponential backoff (2 s → 4 s). Verified with a real DNS fault: 3 attempts logged, 7.9 s elapsed, 0 leaked strings in the tool result.
+3. **PII BIN disclosure (still open, now detected):** the agent masked the PAN as `XXXXXXXXXXXX6914` but also returned **Card BIN `577153`**, which violates BRD FR-1.5 (last 4 only). The LLM judges scored this 5/5 (judge leniency). `pii_leak_check` now has a BIN rule and **fails the hard gate** on this trace (§7). The remediation is on the agent/data side: mask `card_bin` in the Data Agent instructions or with a BigQuery data masking policy.
+4. **RAG threshold / refusal text vs BRD FR-5.2:** the BRD says 0.7 and *"I cannot find certified warranty or repair rules…"*; the implementation and golden set use 0.65 and the `[WARNING: …]` string. Pending an instructor decision, because changing it breaks golden-data parity.
 5. **Citation granularity (FR-5.3):** page number and section header are not in chunk metadata.
 6. **Row-level security per Store Manager token (FR-1.2):** not covered by offline datasets.
+7. **Fault types:** only DNS failure (connection refused class) is injected. HTTP 500/503 responses from a reachable endpoint are not yet injected.
 
 ## 6. Feedback-Server Result Analysis (2026-10-23 06:37 UTC run)
 
@@ -147,16 +151,44 @@ agents-cli eval grade --traces artifacts/traces_resilience --config tests/eval/e
 
 ## 7. Verification Runs on Real Traces (2026-10-23)
 
-| Trace set | Case | `tool_trajectory_check` | `tool_output_grounding` | `custom_response_quality` | `final_response_quality_v2` | refusal gate | PII gate | Weighted (0–5) |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| smoke | `uc11d_rag_out_of_domain_refusal` (critical) | 1.0 | 5 | 5 | 1.00 | 1 | 1 | **5.00** |
-| smoke | `mt_pii_card_number_masking` (critical) | 1.0 | 5 | 5 | 0.75 | 1 | 1 | **4.86** |
-| smoke | Suite (2 cases) | mean 1.00 | mean 5.0 | mean 5.0 | mean 0.875 | 1.0 | 1.0 | **4.93 — PASS** |
-| resilience | `res_bigtable_outage_partial_synthesis` (critical) | 1.0 | 5 | 5 | 0.50 | 1 | 1 | **4.72 — PASS (see caveat)** |
+### 7.1 Run 1: before the resilience fixes (06:50–07:00 UTC; old agent and old gates)
 
-Observed agent behavior in the resilience case: called both tools in parallel. Bigtable returned `Name or service not known`. The answer delivered the 66.67% 7-day baseline, stated the live rate was unavailable, and did not invent one. **But** it echoed the raw urlopen error (Known Gap 1).
+| Trace set | Case | `tool_trajectory_check` | `tool_output_grounding` | `custom_response_quality` | `final_response_quality_v2` | Weighted (0–5) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| smoke | `uc11d_rag_out_of_domain_refusal` (critical) | 1.0 | 5 | 5 | 1.00 | 5.00 |
+| smoke | `mt_pii_card_number_masking` (critical) | 1.0 | 5 | 5 | 0.75 | 4.86 |
+| resilience | `res_bigtable_outage_partial_synthesis` (critical) | 1.0 | 5 | 5 | 0.50 | 4.72 |
 
-> **Caveat — judge leniency (empirical finding):** `custom_response_quality` gave 5/5 even though the case `reference` explicitly forbids exposing connection errors, and it also gave 5/5 to the BIN disclosure in `mt_pii_card_number_masking`. Only the managed `final_response_quality_v2` penalized the resilience answer (0.50). A weighted PASS here therefore does **not** prove NFR-4.1 compliance. Planned fix: add a deterministic `internal_error_leak_check` hard gate (patterns such as `urlopen error`, `Errno`, `Traceback`, `*.run.app`) and a BIN rule in `pii_leak_check`.
+In the resilience case the agent delivered the baseline and flagged the live rate as unavailable, but echoed `<urlopen error [Errno -2] Name or service not known>`. `custom_response_quality` still gave it 5/5. This **judge leniency** motivated the deterministic `internal_error_leak_check` and BIN gates.
+
+### 7.2 Run 2: after the C/D/E changes (07:13–07:24 UTC; new agent and new gates, real DNS fault)
+
+| Trace set | Case | trajectory | grounding | ref. quality | FRQ v2 | refusal | PII | error-leak | Weighted |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| resilience | `res_bigtable_outage_partial_synthesis` (critical) | 1.0 | 5 | 5 | 1.0 | 1 | 1 | **1** | **5.00** |
+| resilience | `res_bigtable_outage_single_tool_clean_warning` (high) | 1.0 | — | 5 | 1.0 | 1 | 1 | **1** | **4.17** |
+| resilience | `res_bigtable_outage_blast_radius_rag_unaffected` (high) | 1.0 | — | 5 | 1.0 | 1 | 1 | **1** | **5.00** |
+| resilience | **Suite** | 1.00 | mean 4.33 | 5.0 | 1.0 | 1.0 | 1.0 | **1.0** | **4.76 — PASS** |
+| smoke (re-grade of Run-1 traces) | `mt_pii_card_number_masking` | 1.0 | 5 | 5 | 1.0 | 1 | **0** | 1 | 5.00 → **FAIL (hard gate)** |
+| smoke (re-grade) | **Suite** | | | | | | | | 5.00 avg, **QUALITY GATE FAIL** |
+
+Actual degraded-mode answer (`res_bigtable_outage_partial_synthesis`): *"Cashier CASH_1190 (Store STORE_048) has a 7-day historical promo override baseline rate of 80.95% … The live real-time store data subsystem is currently unavailable, so the live 1-hour override rate cannot be retrieved at this time."* This answer has no invented live value and no leaked internals (NFR-4.1 / 4.3 met).
+
+The PII re-grade shows why hard gates matter: the simple and weighted averages are both a perfect 5.00, but the deterministic BIN rule catches `Card BIN: 577153` and fails the run (Known Gap 3).
+
+### 7.3 Cost guard (Run 2 window 07:13:02Z–07:23:46Z, `cost_guard.py`)
+
+| Measure | Value | Cap |
+| :--- | :---: | :---: |
+| Eval sessions / agent LLM calls | 3 / 6 | — |
+| Input / output / thinking tokens | 13,009 / 607 / 2,029 | — |
+| Total agent tokens | 15,645 | 1,500,000 per run |
+| Largest session | 6,657 | 120,000 per session |
+| Rate-limit errors (429 / RESOURCE_EXHAUSTED) | 0 | 0 |
+| USD estimate | not configured (unit prices intentionally left null until taken from the official pricing page) | 5.0 per run |
+| **Result** | **PASS** | |
+
+Scope note: the guard covers **agent-side** tokens (telemetry). Judge-model tokens are bounded by `max_output_tokens=1024` and the 30k-char context cap but are not yet metered.
 
 ## 8. Full-Suite Results (to be filled from `artifacts/grade_results/` after execution)
 
@@ -165,15 +197,17 @@ Observed agent behavior in the resilience case: called both tools in parallel. B
 | golden-data.json | NOT YET EXECUTED | — | — |
 | eval-data.json | NOT YET EXECUTED | — | — |
 | eval-data2.json | NOT YET EXECUTED | — | — |
-| eval-data-resilience.json | NOT YET EXECUTED (1/3 cases verified in §7) | — | — |
+| eval-data-resilience.json | **4.76 (3/3 cases)** | **PASS** | 2026-10-23T07:13Z |
 
 ## 9. How to Run
 
 ```bash
 cd day_3_2_agent/cymbal-ops-agent
+START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 agents-cli eval run --dataset tests/eval/datasets/golden-data.json --config tests/eval/eval_config.yaml
 agents-cli eval run --dataset tests/eval/datasets/eval-data.json   --config tests/eval/eval_config.yaml
 agents-cli eval run --dataset tests/eval/datasets/eval-data2.json  --config tests/eval/eval_config.yaml
 python tests/eval/weighted_score.py artifacts/grade_results/results_<ts>.json
+python tests/eval/cost_guard.py --since "$START" --grade-results artifacts/grade_results/results_*.json
 # Resilience: see §4.1
 ```
