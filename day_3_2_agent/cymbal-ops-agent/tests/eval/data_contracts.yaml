@@ -1,0 +1,149 @@
+# Data Contracts for cymbal_operations_agent evaluation
+# -----------------------------------------------------
+# Source of truth for the schemas that the 3 agent tools depend on.
+# Every table schema below was captured from the live project with
+# `bq show --format=json argolisyo:<dataset.table>` on 2026-10-23 and the
+# Bigtable column layout from a live `readRows` call on operations-db.
+# If any upstream schema changes, update this file and re-run the eval suite.
+
+version: 1
+project_id: argolisyo
+captured_at: "2026-10-23T06:17:00Z"
+
+# ---------------------------------------------------------------------------
+# 1. Tool I/O contracts (app/tools/*.py)
+# ---------------------------------------------------------------------------
+tools:
+  cymbal_analytics_tool:
+    module: app/tools/analytics_tool.py
+    backend: "Gemini Data Analytics API (geminidataanalytics.googleapis.com/v1beta) -> projects/argolisyo/locations/global/dataAgents/cymbal-retail-analytics-data-agent"
+    input:
+      query: {type: string, required: true, description: "Verbatim natural-language business question; glossary terms passed as-is"}
+    output:
+      type: string
+      sections_in_order:
+        - "```sql ... ``` block with the last generated SQL (when SQL was generated)"
+        - "Query Result Rows (N rows): <JSON array of row objects>"
+        - "Natural-language summary text from the Data Agent"
+      fallback_prefix: "[FALLBACK:"
+    resilience: {retries: 3, backoff: "exponential 2s, 4s", brd_ref: "NFR-4.2"}
+
+  pos_troubleshooting_rag_tool:
+    module: app/tools/rag_tool.py
+    backend: "BigQuery VECTOR_SEARCH over argolisyo.cymbal_gold.pos_manual_chunk_embeddings"
+    input:
+      query: {type: string, required: true}
+    retrieval:
+      embedding_model: "argolisyo.module1_unstructureddata.pos_text_embedding_model (text-embedding-005, 768 dims)"
+      query_task_type: RETRIEVAL_QUERY
+      top_k: 15
+      distance_type: COSINE
+      vector_score: "1 - cosine_distance"
+      error_code_boost: {pattern: "ERR-[A-Z0-9-]+", boost: 0.25}
+      threshold: {env: RAG_SIMILARITY_THRESHOLD, default: 0.65, compared_against: hybrid_score}
+      stitching: "chunk_index BETWEEN N-1 AND N+1 of the same source_pdf_uri"
+      max_matches: 5
+    output:
+      type: string
+      match_header_regex: '^--- \[MATCH #\d+ \| Hybrid Score: [0-9.]+ \(Vector Score: [0-9.]+\)\] ---$'
+      required_fields_per_match: [Manual, Documentation Link, Stitched Procedure Context]
+      citation_url_prefix: "https://storage.cloud.google.com/"
+      refusal_exact: "[WARNING: Uncertified / Out-of-Scope Hardware Inquiry. Vector similarity score fell below the safety threshold and no certified POS runbook matched your query. Please consult authorized hardware vendor support.]"
+    known_gaps:
+      - "BRD FR-5.2 specifies threshold 0.7 and the refusal text 'I cannot find certified warranty or repair rules for this specific error in our technical repository.' The implementation currently uses 0.65 (lab ADK guide) and a different refusal string. Tracked in evaluation_report.md."
+      - "BRD FR-5.3 asks for page number and section header in citations; chunks currently carry document title + link only."
+
+  read_cashier_realtime_alerts:
+    module: app/tools/bigtable_tool.py
+    backend: "Cloud Run MCP Toolbox (JSON-RPC 2.0 tools/call) https://mcp-toolbox-bigtable-555891812099.us-central1.run.app/mcp"
+    auth: "OIDC ID token (metadata server in cloud; gcloud auth print-identity-token locally); caller needs roles/run.invoker"
+    input:
+      row_key_prefix: {type: string, required: true, pattern: '^STORE_\d{3}(#CASH_\d{4})?$', example: "STORE_048#CASH_1190"}
+    output:
+      type: "string (JSON object)"
+      fields:
+        source: string
+        snapshot_type: string
+        row_key: string
+        audit_status: string
+        cashier_1h_total_discount_usd: number
+        cashier_1h_txn_count: integer
+        cashier_1h_avg_discount_pct: number
+        cashier_1h_manual_override_count: integer
+        cashier_1h_promo_count: integer
+        cashier_1h_promo_rate: number
+        last_event_ts: "string (ISO-8601 UTC)"
+        risk_score: number
+      error_field: error
+      semantics: "Single latest pre-aggregated 1-hour window row; values must NOT be summed across rows."
+
+# ---------------------------------------------------------------------------
+# 2. Upstream data asset contracts
+# ---------------------------------------------------------------------------
+bigtable:
+  instance: operations-db
+  table: cashier_realtime_alerts
+  row_key_format: "STORE_<3-digit>#CASH_<4-digit>#<reverse-timestamp>"
+  column_families:
+    flags:
+      audit_status: "UTF-8 string (e.g. clear)"
+    stats:
+      cashier_1h_txn_count: "INT64 big-endian (8 bytes)"
+      cashier_1h_promo_count: "INT64 big-endian (8 bytes)"
+      cashier_1h_manual_override_count: "INT64 big-endian (8 bytes)"
+      cashier_1h_total_discount_usd: "FLOAT64 big-endian (8 bytes)"
+      cashier_1h_avg_discount_pct: "FLOAT64 big-endian (8 bytes)"
+      cashier_1h_promo_rate: "FLOAT64 big-endian (8 bytes)"
+      risk_score: "FLOAT64 big-endian (8 bytes)"
+      last_event_ts: "UTF-8 ISO-8601 string"
+  mcp_tools_yaml_secret: "projects/argolisyo/secrets/bigtable-mcp-tools-secret"
+
+bigquery:
+  - table: argolisyo.cymbal_gold.pos_manual_chunk_embeddings
+    rows_at_capture: 366
+    partitioning: null
+    schema: {source_pdf_uri: STRING, document_filename: STRING, document_title: STRING, document_part_no: STRING, equipment_covered: STRING, chunk_index: INTEGER, chunk_content: STRING, embedding: "FLOAT REPEATED (768)"}
+    invariants: ["ARRAY_LENGTH(embedding) = 768", "5 distinct document_filename", "chunk length <= 500 chars, step 400 (100-char overlap)"]
+
+  - table: argolisyo.cymbal_gold.pos_transactions_gold
+    rows_at_capture: 8503
+    partitioning: {type: DAY, field: business_date, expiration_days: 7, require_partition_filter: false}
+    schema: {transaction_id: STRING, event_timestamp: TIMESTAMP, business_date: DATE, store_id: STRING, pos_terminal_id: STRING, cashier_id: STRING, customer_id: STRING, customer_loyalty_tier: STRING, payment_method: STRING, payment_network: STRING, card_bin: STRING, is_contactless: BOOLEAN, currency: STRING, item_count: INTEGER, total_quantity: INTEGER, subtotal_amount: NUMERIC, discount: NUMERIC, tax_amount: NUMERIC, total: NUMERIC, promo_code_applied: STRING, manual_discount_flag: BOOLEAN, items: "RECORD REPEATED"}
+    brd_refs: [UC-2.2, NFR-3.3]
+
+  - table: argolisyo.cymbal_gold.pos_anomaly_alerts
+    rows_at_capture: 769
+    partitioning: {type: DAY, field: alert_ts, expiration_days: 90, require_partition_filter: false}
+    clustering: [store_id, alert_type]
+    schema: {alert_id: STRING, store_id: STRING, alert_type: STRING, alert_source: STRING, transaction_id: STRING, cashier_id: STRING, discount_pct: FLOAT, risk_score: FLOAT, alert_ts: TIMESTAMP}
+    brd_refs: [UC-1.3, UC-2.3]
+
+  - table: argolisyo.cymbal_gold.gold_inventory_reconciliation_ledger
+    rows_at_capture: 8400
+    partitioning: null
+    clustering: [reconciliation_status, store_id]
+    schema: {business_date: DATE, store_id: STRING, store_name: STRING, city: STRING, item_id: STRING, unit_price_usd: FLOAT, opening_qty: INTEGER, shelf_qty: INTEGER, backroom_qty: INTEGER, intraday_gross_revenue_usd: FLOAT, est_cover_hours_remaining: FLOAT, reconciliation_status: STRING}
+    glossary_formulas:
+      total_on_hand_inventory: "shelf_qty + backroom_qty"
+      estimated_inventory_cover_hours: "est_cover_hours_remaining"
+    brd_refs: [UC-1.2, NFR-3.2]
+
+  - table: argolisyo.cymbal_gold.historical_transactional_data
+    rows_at_capture: 22390
+    partitioning: {type: DAY, field: business_date}
+    clustering: [transaction_id, store_id, customer_id]
+    schema: {transaction_id: STRING, event_timestamp: TIMESTAMP, store_id: STRING, store_name: STRING, global_region: STRING, pos_terminal_id: STRING, cashier_id: STRING, customer_id: STRING, customer_name: STRING, customer_loyalty_tier: STRING, payment_method: STRING, payment_network: STRING, card_bin: STRING, card_number: STRING, is_contactless: BOOLEAN, currency: STRING, item_count: INTEGER, total_item_quantity: INTEGER, subtotal_amount: FLOAT, subtotal_amount_usd: FLOAT, discount_amount: FLOAT, tax_amount: FLOAT, total_amount: FLOAT, total_amount_usd: FLOAT, promo_code_applied: STRING, manual_discount_flag: BOOLEAN, items: "RECORD REPEATED", _ingested_at: STRING, _source_file: STRING, _batch_id: STRING, _msk_message_id: STRING, business_date: DATE}
+    pii_columns: {card_number: "must be masked as XXXX-XXXX-XXXX-<last4> in any agent response (FR-1.5, NFR-1.2)", customer_name: "personal data"}
+    brd_refs: [UC-2.1, FR-1.5]
+
+  - table: argolisyo.module1_unstructureddata.warranty_generic_sections_extracted
+    rows_at_capture: 26
+    partitioning: null
+    schema: {product_id: STRING, product_name: STRING, brand: STRING, category: STRING, retail_price_usd: FLOAT, warranty_duration_months: INTEGER, warranty_start: STRING, coverage_type: STRING, service_level: STRING, service_region: STRING, coverage_scope_details: STRING, exclusions_and_limitations: STRING, official_retailer_guarantee_and_sla: STRING, support_and_claims_process: STRING, support_url: STRING, support_email: STRING, extracted_full_content: STRING, source_pdf_uri: STRING}
+    join_key: "product_id = historical_transactional_data.items.item_id"
+    brd_refs: [UC-2.1]
+
+  - table: cymbal-lakehouse.elevate_data.silver_pos_transactions
+    location: "AWS S3 Iceberg via BigLake federation (FR-3.1)"
+    used_by: "UC-2.3 step 2 (checkout logs for top offender)"
+    note: "Remote schema not captured here; columns observed in agent output include transaction_id, event_timestamp, store_id, cashier_id, payment_method, total_amount_usd, contains_harmful_batch."

@@ -560,10 +560,10 @@ resource "terraform_data" "deploy_models" {
   provisioner "local-exec" {
     working_dir = path.module
     command     = <<-EOT
-      python3 -m venv .venv_temp
+      uv venv .venv_temp
       trap 'rm -rf .venv_temp' EXIT
-      source .venv_temp/bin/activate
-      pip install -r requirements.txt
+      . .venv_temp/bin/activate
+      uv pip install -r requirements.txt
       python deploy_models.py \
         --register \
         --project_id="${var.project_id}" \
