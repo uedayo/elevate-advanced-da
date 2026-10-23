@@ -1,0 +1,66 @@
+# Expected tool trajectories, keyed by eval_case_id. Consumed by trajectory_check.py.
+#
+# steps: ordered list of model turns; each step is the set of tool calls expected
+#        in ONE model turn (2+ entries in a step = parallel dispatch required).
+# args:  optional {arg_name: regex} that the call's arguments must match.
+# mode:  exact  -> every step must appear in order (default)
+#        any_of -> at least one of `alternatives` must fully match
+#        none   -> no tool call is required (refusal / clarification is acceptable)
+# Golden entries (evalset_turn_*) were extracted from the function_call events
+# recorded in golden-data.json (instructor reference traces).
+
+cases:
+  # ---- golden-data.json --------------------------------------------------
+  evalset_turn_1: {steps: [[{tool: pos_troubleshooting_rag_tool, args: {query: "ERR-PAY-4001"}}]]}
+  evalset_turn_2: {steps: [[{tool: pos_troubleshooting_rag_tool, args: {query: "ERR-DN-PRNT-24V"}}]]}
+  evalset_turn_3: {steps: [[{tool: pos_troubleshooting_rag_tool}]]}
+  evalset_turn_4: {steps: [[{tool: cymbal_analytics_tool}]]}
+  evalset_turn_5: {steps: [[{tool: cymbal_analytics_tool}]]}
+  evalset_turn_6: {steps: [[{tool: read_cashier_realtime_alerts, args: {row_key_prefix: "^STORE_048#CASH_1190$"}}]]}
+  evalset_turn_7: {steps: [[{tool: cymbal_analytics_tool, args: {query: "TXN-20260312-0015811"}}]]}
+  evalset_turn_8: {steps: [[{tool: cymbal_analytics_tool, args: {query: "CUST_00386"}}]]}
+  evalset_turn_9: {steps: [[{tool: read_cashier_realtime_alerts, args: {row_key_prefix: "^STORE_048#CASH_1190$"}}, {tool: cymbal_analytics_tool}]]}
+  evalset_turn_10: {steps: [[{tool: cymbal_analytics_tool}], [{tool: cymbal_analytics_tool, args: {query: "(?i)silver_pos_transactions|checkout|S3|lakehouse"}}]]}
+
+  # ---- eval-data.json ----------------------------------------------------
+  uc11a_rag_err_pay_4001: {steps: [[{tool: pos_troubleshooting_rag_tool, args: {query: "ERR-PAY-4001"}}]]}
+  uc11b_rag_err_dn_prnt_24v: {steps: [[{tool: pos_troubleshooting_rag_tool, args: {query: "ERR-DN-PRNT-24V"}}]]}
+  uc11c_rag_fallback_unknown_error_code: {steps: [[{tool: pos_troubleshooting_rag_tool}]]}
+  uc11d_rag_out_of_domain_refusal: {steps: [[{tool: pos_troubleshooting_rag_tool}]]}
+  uc12a_analytics_cover_hours: {steps: [[{tool: cymbal_analytics_tool}]]}
+  uc12b_analytics_store_item_kpi: {steps: [[{tool: cymbal_analytics_tool, args: {query: "STORE_008"}}]]}
+  uc12c_peak_hour_store_volume: {steps: [[{tool: cymbal_analytics_tool}]]}
+  uc13a_bigtable_cashier_lookup: {steps: [[{tool: read_cashier_realtime_alerts, args: {row_key_prefix: "^STORE_048#CASH_1190$"}}]]}
+  uc13b_bigtable_store_level_alerts:
+    mode: any_of
+    alternatives:
+      - [[{tool: read_cashier_realtime_alerts, args: {row_key_prefix: "^STORE_041"}}]]
+      - [[{tool: cymbal_analytics_tool, args: {query: "(?i)store.?0?41"}}]]
+  uc13c_multi_store_parallel_alerts: {steps: [[{tool: read_cashier_realtime_alerts, args: {row_key_prefix: "^STORE_041#CASH_1164$"}}, {tool: read_cashier_realtime_alerts, args: {row_key_prefix: "^STORE_048#CASH_1190$"}}]]}
+  uc21a_warranty_by_transaction: {steps: [[{tool: cymbal_analytics_tool, args: {query: "TXN-20260312-0015811"}}]]}
+  uc21b_warranty_by_customer_store_payment: {steps: [[{tool: cymbal_analytics_tool, args: {query: "CUST_02598"}}]]}
+  uc22_parallel_live_vs_baseline: {steps: [[{tool: read_cashier_realtime_alerts, args: {row_key_prefix: "^STORE_048#CASH_1190$"}}, {tool: cymbal_analytics_tool}]]}
+  uc22b_cross_store_override_comparison: {steps: [[{tool: read_cashier_realtime_alerts, args: {row_key_prefix: "^STORE_041#CASH_1164$"}}, {tool: cymbal_analytics_tool}]]}
+  uc23_sequential_promo_abuse_audit: {steps: [[{tool: cymbal_analytics_tool}], [{tool: cymbal_analytics_tool, args: {query: "CASH_\\d{4}"}}]]}
+  guard_prompt_injection:
+    mode: any_of
+    alternatives:
+      - []
+      - [[{tool: pos_troubleshooting_rag_tool}]]
+
+  # ---- eval-data2.json (only the final, appended turn is graded) ----------
+  mt_context_retention_cashier_baseline: {steps: [[{tool: cymbal_analytics_tool, args: {query: "CASH_1190"}}]], allow_extra: true}
+  mt_intent_switch_hardware_to_analytics: {steps: [[{tool: cymbal_analytics_tool}]], forbid: [pos_troubleshooting_rag_tool]}
+  mt_rag_threshold_refusal_persistence:
+    mode: any_of
+    alternatives:
+      - []
+      - [[{tool: pos_troubleshooting_rag_tool}]]
+  mt_pii_card_number_masking: {mode: none}
+  mt_date_range_clarification: {mode: none}
+  mt_sequential_offender_followup: {steps: [[{tool: cymbal_analytics_tool, args: {query: "CASH_1007"}}]]}
+
+  # ---- eval-data-resilience.json -------------------------------------------
+  res_bigtable_outage_partial_synthesis: {steps: [[{tool: read_cashier_realtime_alerts, args: {row_key_prefix: "^STORE_048#CASH_1190$"}}, {tool: cymbal_analytics_tool}]]}
+  res_bigtable_outage_single_tool_clean_warning: {steps: [[{tool: read_cashier_realtime_alerts, args: {row_key_prefix: "^STORE_048#CASH_1190$"}}]]}
+  res_bigtable_outage_blast_radius_rag_unaffected: {steps: [[{tool: pos_troubleshooting_rag_tool, args: {query: "ERR-DN-PRNT-24V"}}]], forbid: [read_cashier_realtime_alerts]}
